@@ -1,164 +1,41 @@
-#include "../src/Network.h"
 #include "../src/uWS.h"
 
 #include <node.h>
 #include <node_buffer.h>
 #include <cstring>
-#include <iostream>
-#include <future>
-
-// move this to core?
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
-
 #include <uv.h>
 
 using namespace std;
 using namespace v8;
-using namespace uWS;
-
-enum {
-    CONNECTION_CALLBACK = 2,
-    DISCONNECTION_CALLBACK,
-    MESSAGE_CALLBACK,
-    PING_CALLBACK,
-    PONG_CALLBACK
-};
 
 Persistent<Object> persistentTicket;
 
-void Server(const FunctionCallbackInfo<Value> &args) {
-    if (args.IsConstructCall()) {
-        try {
-            EventSystem *es = new EventSystem(MASTER);
-            args.This()->SetAlignedPointerInInternalField(0, new uWS::Server(*es, args[0]->IntegerValue(), args[1]->IntegerValue(), args[2]->IntegerValue()));
-            args.This()->SetAlignedPointerInInternalField(1, es);
+enum {
+    HUB_PTR,
+    SERVER_CONNECTION_CALLBACK,
+    CLIENT_CONNECTION_CALLBACK,
 
-            // todo: these needs to be removed on destruction
-            args.This()->SetAlignedPointerInInternalField(CONNECTION_CALLBACK, new Persistent<Function>);
-            args.This()->SetAlignedPointerInInternalField(DISCONNECTION_CALLBACK, new Persistent<Function>);
-            args.This()->SetAlignedPointerInInternalField(MESSAGE_CALLBACK, new Persistent<Function>);
-            args.This()->SetAlignedPointerInInternalField(PING_CALLBACK, new Persistent<Function>);
-            args.This()->SetAlignedPointerInInternalField(PONG_CALLBACK, new Persistent<Function>);
-        } catch (...) {
-            args.This()->Set(String::NewFromUtf8(args.GetIsolate(), "error"), Boolean::New(args.GetIsolate(), true));
-        }
-        args.GetReturnValue().Set(args.This());
-    }
-}
+    SERVER_MESSAGE_CALLBACK,
+    CLIENT_MESSAGE_CALLBACK,
 
-struct Socket : uWS::WebSocket {
-    Socket(uv_poll_t *s) : uWS::WebSocket(s) {}
-    Socket(const uWS::WebSocket &s) : uWS::WebSocket(s) {}
-    uv_poll_t **getSocketPtr() {return &p;}
+    SERVER_PING_CALLBACK,
+    CLIENT_PING_CALLBACK,
+
+    SERVER_PONG_CALLBACK,
+    CLIENT_PONG_CALLBACK,
+
+    SERVER_DISCONNECTION_CALLBACK,
+    CLIENT_DISCONNECTION_CALLBACK,
+
+    SIZE_OF_HUB
 };
 
-inline Local<Number> wrapSocket(uWS::WebSocket socket, Isolate *isolate) {
-    return Number::New(isolate, *(double *) Socket(socket).getSocketPtr());
-}
-
-inline uWS::WebSocket unwrapSocket(Local<Number> number) {
-    union {
-        double number;
-        uv_poll_t *socket;
-    } socketUnwrapper = {number->Value()};
-    return Socket(socketUnwrapper.socket);
-}
-
-void onConnection(const FunctionCallbackInfo<Value> &args) {
-    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-    Isolate *isolate = args.GetIsolate();
-    Persistent<Function> *connectionCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(CONNECTION_CALLBACK);
-    connectionCallback->Reset(isolate, Local<Function>::Cast(args[0]));
-    server->onConnection([isolate, connectionCallback](uWS::WebSocket socket) {
-        HandleScope hs(isolate);
-        Local<Value> argv[] = {wrapSocket(socket, isolate)};
-        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *connectionCallback), 1, argv);
-    });
-}
-
-inline Local<Value> getDataV8(uWS::WebSocket socket, Isolate *isolate) {
-    return socket.getData() ? Local<Value>::New(isolate, *(Persistent<Value> *) socket.getData()) : Local<Value>::Cast(Undefined(isolate));
-}
-
-inline Local<Value> wrapMessage(const char *message, size_t length, uWS::OpCode opCode, Isolate *isolate) {
-    return opCode == BINARY ? (Local<Value>) ArrayBuffer::New(isolate, (char *) message, length) : (Local<Value>) String::NewFromUtf8(isolate, message, String::kNormalString, length);
-}
-
-void onMessage(const FunctionCallbackInfo<Value> &args) {
-    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-    Isolate *isolate = args.GetIsolate();
-    Persistent<Function> *messageCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(MESSAGE_CALLBACK);
-    messageCallback->Reset(isolate, Local<Function>::Cast(args[0]));
-    server->onMessage([isolate, messageCallback](uWS::WebSocket socket, const char *message, size_t length, uWS::OpCode opCode) {
-        HandleScope hs(isolate);
-        Local<Value> argv[] = {wrapMessage(message, length, opCode, isolate),
-                               getDataV8(socket, isolate)};
-        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *messageCallback), 2, argv);
-    });
-}
-
-void onPing(const FunctionCallbackInfo<Value> &args) {
-  uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-  Isolate *isolate = args.GetIsolate();
-  Persistent<Function> *pingCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(PING_CALLBACK);
-  pingCallback->Reset(isolate, Local<Function>::Cast(args[0]));
-  server->onPing([isolate, pingCallback](uWS::WebSocket socket, const char *message, size_t length) {
-      HandleScope hs(isolate);
-      Local<Value> argv[] = {wrapMessage(message, length, PING, isolate),
-                             getDataV8(socket, isolate)};
-      node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *pingCallback), 2, argv);
-  });
-}
-
-void onPong(const FunctionCallbackInfo<Value> &args) {
-    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-    Isolate *isolate = args.GetIsolate();
-    Persistent<Function> *pongCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(PONG_CALLBACK);
-    pongCallback->Reset(isolate, Local<Function>::Cast(args[0]));
-    server->onPong([isolate, pongCallback](uWS::WebSocket socket, const char *message, size_t length) {
-        HandleScope hs(isolate);
-        Local<Value> argv[] = {wrapMessage(message, length, PONG, isolate),
-                               getDataV8(socket, isolate)};
-        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *pongCallback), 2, argv);
-    });
-}
-
-void onDisconnection(const FunctionCallbackInfo<Value> &args) {
-    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-    Isolate *isolate = args.GetIsolate();
-    Persistent<Function> *disconnectionCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(DISCONNECTION_CALLBACK);
-    disconnectionCallback->Reset(isolate, Local<Function>::Cast(args[0]));
-    server->onDisconnection([isolate, disconnectionCallback](uWS::WebSocket socket, int code, char *message, size_t length) {
-        HandleScope hs(isolate);
-        Local<Value> argv[] = {wrapSocket(socket, isolate),
-                               Integer::New(isolate, code),
-                               wrapMessage(message, length, CLOSE, isolate),
-                               getDataV8(socket, isolate)};
-        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *disconnectionCallback), 4, argv);
-    });
-}
-
-void setData(const FunctionCallbackInfo<Value> &args)
-{
-    uWS::WebSocket socket = unwrapSocket(args[0]->ToNumber());
-    if (socket.getData()) {
-        /* reset data when only specifying the socket */
-        if (args.Length() == 1) {
-            ((Persistent<Value> *) socket.getData())->Reset();
-            delete (Persistent<Value> *) socket.getData();
-        } else {
-            ((Persistent<Value> *) socket.getData())->Reset(args.GetIsolate(), args[1]);
-        }
-    } else {
-        socket.setData(new Persistent<Value>(args.GetIsolate(), args[1]));
-    }
-}
-
-void getData(const FunctionCallbackInfo<Value> &args)
-{
-    args.GetReturnValue().Set(getDataV8(unwrapSocket(args[0]->ToNumber()), args.GetIsolate()));
-}
+union SocketUnion {
+    double number;
+    uv_poll_t *pollHandle;
+};
 
 class NativeString {
     char *data;
@@ -166,8 +43,7 @@ class NativeString {
     char utf8ValueMemory[sizeof(String::Utf8Value)];
     String::Utf8Value *utf8Value = nullptr;
 public:
-    NativeString(const Local<Value> &value)
-    {
+    NativeString(const Local<Value> &value) {
         if (value->IsUndefined()) {
             data = nullptr;
             length = 0;
@@ -197,49 +73,70 @@ public:
 
     char *getData() {return data;}
     size_t getLength() {return length;}
-    ~NativeString()
-    {
+    ~NativeString() {
         if (utf8Value) {
             utf8Value->~Utf8Value();
         }
     }
 };
 
-void close(const FunctionCallbackInfo<Value> &args)
-{
-    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-    if (args.Length()) {
-        // socket, code, data
-        uWS::WebSocket socket = unwrapSocket(args[0]->ToNumber());
-        NativeString nativeString(args[2]);
-        socket.close(false, args[1]->IntegerValue(), nativeString.getData(), nativeString.getLength());
+template <bool isServer>
+inline Local<Number> wrapSocket(uWS::WebSocket<isServer> webSocket, Isolate *isolate) {
+    SocketUnion socketUnion;
+    socketUnion.pollHandle = webSocket.getPollHandle();
+    return Number::New(isolate, socketUnion.number);
+}
+
+template <bool isServer>
+inline uWS::WebSocket<isServer> unwrapSocket(Local<Number> number) {
+    SocketUnion socketUnion;
+    socketUnion.number = number->Value();
+    return uWS::WebSocket<isServer>(socketUnion.pollHandle);
+}
+
+inline Local<Value> wrapMessage(const char *message, size_t length, uWS::OpCode opCode, Isolate *isolate) {
+    return opCode == uWS::OpCode::BINARY ? (Local<Value>) ArrayBuffer::New(isolate, (char *) message, length) : (Local<Value>) String::NewFromUtf8(isolate, message, String::kNormalString, length);
+}
+
+template <bool isServer>
+inline Local<Value> getDataV8(uWS::WebSocket<isServer> webSocket, Isolate *isolate) {
+    return webSocket.getUserData() ? Local<Value>::New(isolate, *(Persistent<Value> *) webSocket.getUserData()) : Local<Value>::Cast(Undefined(isolate));
+}
+
+template <bool isServer>
+void getUserData(const FunctionCallbackInfo<Value> &args) {
+    args.GetReturnValue().Set(getDataV8(unwrapSocket<isServer>(args[0]->ToNumber()), args.GetIsolate()));
+}
+
+template <bool isServer>
+void clearUserData(const FunctionCallbackInfo<Value> &args) {
+    uWS::WebSocket<isServer> webSocket = unwrapSocket<isServer>(args[0]->ToNumber());
+    ((Persistent<Value> *) webSocket.getUserData())->Reset();
+    delete (Persistent<Value> *) webSocket.getUserData();
+}
+
+template <bool isServer>
+void setUserData(const FunctionCallbackInfo<Value> &args) {
+    uWS::WebSocket<isServer> webSocket = unwrapSocket<isServer>(args[0]->ToNumber());
+    if (webSocket.getUserData()) {
+        ((Persistent<Value> *) webSocket.getUserData())->Reset(args.GetIsolate(), args[1]);
     } else {
-        server->close(false);
+        webSocket.setUserData(new Persistent<Value>(args.GetIsolate(), args[1]));
     }
 }
 
-void upgrade(const FunctionCallbackInfo<Value> &args)
+template <bool isServer>
+void getAddress(const FunctionCallbackInfo<Value> &args)
 {
-    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
-    Local<Object> ticket = args[0]->ToObject();
-    NativeString secKey(args[1]);
-    NativeString extensions(args[2]);
-
-    uv_os_sock_t *fd = (uv_os_sock_t *) ticket->GetAlignedPointerFromInternalField(0);
-    SSL *ssl = (SSL *) ticket->GetAlignedPointerFromInternalField(1);
-
-    if (*fd != INVALID_SOCKET) {
-        server->upgrade(*fd, secKey.getData(), ssl, extensions.getData(), extensions.getLength());
-    } else {
-        if (ssl) {
-            SSL_free(ssl);
-        }
-    }
-    delete fd;
+    typename uWS::WebSocket<isServer>::Address address = unwrapSocket<isServer>(args[0]->ToNumber()).getAddress();
+    Local<Array> array = Array::New(args.GetIsolate(), 3);
+    array->Set(0, Integer::New(args.GetIsolate(), address.port));
+    array->Set(1, String::NewFromUtf8(args.GetIsolate(), address.address));
+    array->Set(2, String::NewFromUtf8(args.GetIsolate(), address.family));
+    args.GetReturnValue().Set(array);
 }
 
-uv_handle_t *getTcpHandle(void *handleWrap)
-{
+uv_handle_t *getTcpHandle(void *handleWrap) {
     volatile char *memory = (volatile char *) handleWrap;
     for (volatile uv_handle_t *tcpHandle = (volatile uv_handle_t *) memory; tcpHandle->type != UV_TCP
          || tcpHandle->data != handleWrap || tcpHandle->loop != uv_default_loop(); tcpHandle = (volatile uv_handle_t *) memory) {
@@ -248,9 +145,70 @@ uv_handle_t *getTcpHandle(void *handleWrap)
     return (uv_handle_t *) memory;
 }
 
-void transfer(const FunctionCallbackInfo<Value> &args)
+struct SendCallbackData {
+    Persistent<Function> jsCallback;
+    Isolate *isolate;
+};
+
+void sendCallback(void *webSocket, void *data, bool cancelled)
 {
-    /* (_handle.fd OR _handle), SSL */
+    SendCallbackData *sc = (SendCallbackData *) data;
+    if (!cancelled) {
+        HandleScope hs(sc->isolate);
+        node::MakeCallback(sc->isolate, sc->isolate->GetCurrentContext()->Global(), Local<Function>::New(sc->isolate, sc->jsCallback), 0, nullptr);
+    }
+    sc->jsCallback.Reset();
+    delete sc;
+}
+
+template <bool isServer>
+void send(const FunctionCallbackInfo<Value> &args)
+{
+    uWS::OpCode opCode = (uWS::OpCode) args[2]->IntegerValue();
+    NativeString nativeString(args[1]);
+
+    SendCallbackData *sc = nullptr;
+    void (*callback)(void *, void *, bool) = nullptr;
+
+    if (args[3]->IsFunction()) {
+        callback = sendCallback;
+        sc = new SendCallbackData;
+        sc->jsCallback.Reset(args.GetIsolate(), Local<Function>::Cast(args[3]));
+        sc->isolate = args.GetIsolate();
+    }
+
+    unwrapSocket<isServer>(args[0]->ToNumber()).send(nativeString.getData(),
+                           nativeString.getLength(), opCode, callback, sc);
+}
+
+void connect(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    NativeString uri(args[0]);
+    hub->connect(std::string(uri.getData(), uri.getLength()), new Persistent<Value>(args.GetIsolate(), args[1]));
+}
+
+void upgrade(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    Local<Object> ticket = args[0]->ToObject();
+    NativeString secKey(args[1]);
+    NativeString extensions(args[2]);
+
+    uv_os_sock_t *fd = (uv_os_sock_t *) ticket->GetAlignedPointerFromInternalField(0);
+    SSL *ssl = (SSL *) ticket->GetAlignedPointerFromInternalField(1);
+
+    // todo: move this check into core!
+    if (*fd != INVALID_SOCKET) {
+        hub->upgrade(*fd, secKey.getData(), ssl, extensions.getData(), extensions.getLength());
+    } else {
+        if (ssl) {
+            SSL_free(ssl);
+        }
+    }
+    delete fd;
+}
+
+void transfer(const FunctionCallbackInfo<Value> &args) {
+    // (_handle.fd OR _handle), SSL
     uv_os_sock_t *fd = new uv_os_sock_t;
     if (args[0]->IsObject()) {
         uv_fileno(getTcpHandle(args[0]->ToObject()->GetAlignedPointerFromInternalField(0)), (uv_os_fd_t *) fd);
@@ -271,51 +229,100 @@ void transfer(const FunctionCallbackInfo<Value> &args)
     args.GetReturnValue().Set(ticket);
 }
 
-struct SendCallback {
-    Persistent<Function> jsCallback;
-    Isolate *isolate;
-};
-
-void sendCallback(uWS::WebSocket webSocket, void *data, bool cancelled)
-{
-    SendCallback *sc = (SendCallback *) data;
-    if (!cancelled) {
-        HandleScope hs(sc->isolate);
-        node::MakeCallback(sc->isolate, sc->isolate->GetCurrentContext()->Global(), Local<Function>::New(sc->isolate, sc->jsCallback), 0, nullptr);
+void Hub(const FunctionCallbackInfo<Value> &args) {
+    if (args.IsConstructCall()) {
+        // todo: these needs to be removed on destruction
+        args.This()->SetAlignedPointerInInternalField(HUB_PTR, new uWS::Hub);
+        for (int i = 1; i < SIZE_OF_HUB; i++) {
+            args.This()->SetAlignedPointerInInternalField(i, new Persistent<Function>);
+        }
+        args.GetReturnValue().Set(args.This());
     }
-    sc->jsCallback.Reset();
-    delete sc;
 }
 
-void send(const FunctionCallbackInfo<Value> &args)
-{
-    OpCode opCode = (uWS::OpCode) args[2]->IntegerValue();
-    NativeString nativeString(args[1]);
-
-    SendCallback *sc = nullptr;
-    void (*callback)(WebSocket, void *, bool) = nullptr;
-
-    if (args[3]->IsFunction()) {
-        callback = sendCallback;
-        sc = new SendCallback;
-        sc->jsCallback.Reset(args.GetIsolate(), Local<Function>::Cast(args[3]));
-        sc->isolate = args.GetIsolate();
-    }
-
-    unwrapSocket(args[0]->ToNumber())
-                 .send(nativeString.getData(),
-                 nativeString.getLength(),
-                 opCode, callback, sc);
+template <bool isServer>
+void onConnection(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    Isolate *isolate = args.GetIsolate();
+    Persistent<Function> *connectionCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(CLIENT_CONNECTION_CALLBACK - isServer);
+    connectionCallback->Reset(isolate, Local<Function>::Cast(args[0]));
+    hub->onConnection([isolate, connectionCallback](uWS::WebSocket<isServer> webSocket) {
+        HandleScope hs(isolate);
+        Local<Value> argv[] = {wrapSocket(webSocket, isolate)};
+        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *connectionCallback), 1, argv);
+    });
 }
 
-void getAddress(const FunctionCallbackInfo<Value> &args)
+template <bool isServer>
+void onMessage(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    Isolate *isolate = args.GetIsolate();
+    Persistent<Function> *messageCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(CLIENT_MESSAGE_CALLBACK - isServer);
+    messageCallback->Reset(isolate, Local<Function>::Cast(args[0]));
+    hub->onMessage([isolate, messageCallback](uWS::WebSocket<isServer> webSocket, const char *message, size_t length, uWS::OpCode opCode) {
+        HandleScope hs(isolate);
+        Local<Value> argv[] = {wrapMessage(message, length, opCode, isolate),
+                               getDataV8(webSocket, isolate)};
+        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *messageCallback), 2, argv);
+    });
+}
+
+template <bool isServer>
+void onPing(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    Isolate *isolate = args.GetIsolate();
+    Persistent<Function> *pingCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(CLIENT_PING_CALLBACK - isServer);
+    pingCallback->Reset(isolate, Local<Function>::Cast(args[0]));
+    hub->onPing([isolate, pingCallback](uWS::WebSocket<isServer> webSocket, const char *message, size_t length) {
+        HandleScope hs(isolate);
+        Local<Value> argv[] = {wrapMessage(message, length, uWS::OpCode::PING, isolate),
+                               getDataV8(webSocket, isolate)};
+        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *pingCallback), 2, argv);
+    });
+}
+
+template <bool isServer>
+void onPong(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    Isolate *isolate = args.GetIsolate();
+    Persistent<Function> *pongCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(CLIENT_PONG_CALLBACK - isServer);
+    pongCallback->Reset(isolate, Local<Function>::Cast(args[0]));
+    hub->onPong([isolate, pongCallback](uWS::WebSocket<isServer> webSocket, const char *message, size_t length) {
+        HandleScope hs(isolate);
+        Local<Value> argv[] = {wrapMessage(message, length, uWS::OpCode::PONG, isolate),
+                               getDataV8(webSocket, isolate)};
+        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *pongCallback), 2, argv);
+    });
+}
+
+template <bool isServer>
+void onDisconnection(const FunctionCallbackInfo<Value> &args) {
+    uWS::Hub *hub = (uWS::Hub *) args.Holder()->GetAlignedPointerFromInternalField(HUB_PTR);
+    Isolate *isolate = args.GetIsolate();
+    Persistent<Function> *disconnectionCallback = (Persistent<Function> *) args.Holder()->GetAlignedPointerFromInternalField(CLIENT_DISCONNECTION_CALLBACK - isServer);
+    disconnectionCallback->Reset(isolate, Local<Function>::Cast(args[0]));
+    hub->onDisconnection([isolate, disconnectionCallback](uWS::WebSocket<isServer> webSocket, int code, char *message, size_t length) {
+        HandleScope hs(isolate);
+        Local<Value> argv[] = {wrapSocket(webSocket, isolate),
+                               Integer::New(isolate, code),
+                               wrapMessage(message, length, uWS::OpCode::CLOSE, isolate),
+                               getDataV8(webSocket, isolate)};
+        node::MakeCallback(isolate, isolate->GetCurrentContext()->Global(), Local<Function>::New(isolate, *disconnectionCallback), 4, argv);
+    });
+}
+
+/*
+void close(const FunctionCallbackInfo<Value> &args)
 {
-    uWS::WebSocket::Address address = unwrapSocket(args[0]->ToNumber()).getAddress();
-    Local<Array> array = Array::New(args.GetIsolate(), 3);
-    array->Set(0, Integer::New(args.GetIsolate(), address.port));
-    array->Set(1, String::NewFromUtf8(args.GetIsolate(), address.address));
-    array->Set(2, String::NewFromUtf8(args.GetIsolate(), address.family));
-    args.GetReturnValue().Set(array);
+    uWS::Server *server = (uWS::Server *) args.Holder()->GetAlignedPointerFromInternalField(0);
+    if (args.Length()) {
+        // socket, code, data
+        uWS::WebSocket socket = unwrapSocket(args[0]->ToNumber());
+        NativeString nativeString(args[2]);
+        socket.close(false, args[1]->IntegerValue(), nativeString.getData(), nativeString.getLength());
+    } else {
+        server->close(false);
+    }
 }
 
 void broadcast(const FunctionCallbackInfo<Value> &args)
@@ -344,32 +351,59 @@ void sendPrepared(const FunctionCallbackInfo<Value> &args)
 void finalizeMessage(const FunctionCallbackInfo<Value> &args)
 {
     WebSocket::finalizeMessage((WebSocket::PreparedMessage *) args[0]->ToObject()->GetAlignedPointerFromInternalField(0));
-}
+}*/
 
 void Main(Local<Object> exports) {
     Isolate *isolate = exports->GetIsolate();
-    Local<FunctionTemplate> tpl = FunctionTemplate::New(isolate, ::Server);
-    tpl->InstanceTemplate()->SetInternalFieldCount(7);
+    Local<FunctionTemplate> hubTemplate = FunctionTemplate::New(isolate, Hub);
+    hubTemplate->InstanceTemplate()->SetInternalFieldCount(SIZE_OF_HUB);
 
-    NODE_SET_PROTOTYPE_METHOD(tpl, "onConnection", onConnection);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "onMessage", onMessage);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "onPing", onPing);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "onPong", onPong);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "onDisconnection", onDisconnection);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onConnectionServer", onConnection<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onConnectionClient", onConnection<uWS::CLIENT>);
+    
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onMessageServer", onMessage<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onMessageClient", onMessage<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onPingServer", onPing<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onPingClient", onPing<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onPongServer", onPong<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onPongClient", onPong<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onDisconnectionServer", onDisconnection<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "onDisconnectionClient", onDisconnection<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "setUserDataServer", setUserData<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "setUserDataClient", setUserData<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "getUserDataServer", getUserData<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "getUserDataClient", getUserData<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "clearUserDataServer", clearUserData<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "clearUserDataClient", clearUserData<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "getAddressServer", getAddress<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "getAddressClient", getAddress<uWS::CLIENT>);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "sendServer", send<uWS::SERVER>);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "sendClient", send<uWS::CLIENT>);
+
+    // subject to change!
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "transfer", transfer);
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "upgrade", upgrade);
+
+    NODE_SET_PROTOTYPE_METHOD(hubTemplate, "connect", connect);
+
+
+    /*
     NODE_SET_PROTOTYPE_METHOD(tpl, "close", close);
     NODE_SET_PROTOTYPE_METHOD(tpl, "broadcast", broadcast);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "upgrade", upgrade);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "transfer", transfer);
 
-    NODE_SET_PROTOTYPE_METHOD(tpl, "setData", setData);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "getData", getData);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "send", send);
     NODE_SET_PROTOTYPE_METHOD(tpl, "prepareMessage", prepareMessage);
     NODE_SET_PROTOTYPE_METHOD(tpl, "sendPrepared", sendPrepared);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "finalizeMessage", finalizeMessage);
-    NODE_SET_PROTOTYPE_METHOD(tpl, "getAddress", getAddress);
+    NODE_SET_PROTOTYPE_METHOD(tpl, "finalizeMessage", finalizeMessage);*/
 
-    exports->Set(String::NewFromUtf8(isolate, "Server"), tpl->GetFunction());
+    exports->Set(String::NewFromUtf8(isolate, "Hub"), hubTemplate->GetFunction());
 
     Local<ObjectTemplate> ticketTemplate = ObjectTemplate::New(isolate);
     ticketTemplate->SetInternalFieldCount(2);

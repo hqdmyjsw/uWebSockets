@@ -24,13 +24,33 @@ const uws = (() => {
     }
 })();
 
-class Socket {
-    /**
-     * Creates a Socket instance.
-     *
-     * @param {Object} nativeSocket Socket instance
-     * @param {Server} server Server instance
-     */
+const hub = new uws.Hub;
+hub.onConnectionClient((nativeWebSocketClient) => {
+    const webSocketClient = hub.getUserDataClient(nativeWebSocketClient);
+    webSocketClient.nativeSocket = nativeWebSocketClient;
+    webSocketClient.internalOnOpen();
+});
+
+hub.onMessageClient((message, webSocketClient) => {
+    webSocketClient.internalOnMessage(message);
+});
+
+hub.onDisconnectionClient((nativeSocket, code, message, socketData) => {
+    socketData.nativeServer = socketData.nativeSocket = null;
+    socketData.internalOnClose(code, message);
+    this.nativeServer.clearUserDataClient(nativeSocket);
+});
+
+hub.onPingClient((message, socketData) => {
+    socketData.onping(message);
+});
+
+hub.onPongClient((message, socketData) => {
+    socketData.onpong(message);
+});
+
+class WebSocket {
+
     constructor(nativeSocket, nativeServer) {
         this.nativeSocket = nativeSocket;
         this.nativeServer = nativeServer;
@@ -74,13 +94,6 @@ class Socket {
         return this;
     }
 
-    /**
-     * Registers a callback for given eventName.
-     *
-     * @param {String} eventName Event name
-     * @param {Function} f Event listener
-     * @public
-     */
     on(eventName, f) {
         if (eventName === 'message') {
             if (this.internalOnMessage !== noop) {
@@ -102,17 +115,15 @@ class Socket {
                 throw Error(EE_ERROR);
             }
             this.onpong = f;
+        } else if (eventName === 'open') {
+            if (this.internalOnOpen !== noop) {
+                throw Error(EE_ERROR);
+            }
+            this.internalOnOpen = f;
         }
         return this;
     }
 
-    /**
-     * Registers a callback for given eventName to be executed once.
-     *
-     * @param {String} eventName Event name
-     * @param {Function} f Event listener
-     * @public
-     */
     once(eventName, f) {
         if (eventName === 'message') {
             if (this.internalOnMessage !== noop) {
@@ -150,13 +161,6 @@ class Socket {
         return this;
     }
 
-    /**
-     * Removes all registered callbacks for the given eventName
-     * or, in the case of no eventName, all registered callbacks.
-     *
-     * @param {String} [eventName] Event name
-     * @public
-     */
     removeAllListeners(eventName) {
         if (!eventName || eventName === 'message') {
             this.internalOnMessage = noop;
@@ -173,13 +177,6 @@ class Socket {
         return this;
     }
 
-    /**
-     * Removes one registered callback for the given eventName.
-     *
-     * @param {String} eventName Event name
-     * @param {Function} callback
-     * @public
-     */
     removeListener(eventName, cb) {
         if (eventName === 'message' && this.internalOnMessage === cb) {
             this.internalOnMessage = noop;
@@ -193,16 +190,40 @@ class Socket {
         return this;
     }
 
-    /**
-     * Sends a message.
-     *
-     * @param {String|ArrayBuffer} message The message to send
-     * @param {Object} options Send options
-     * @param {Function} cb optional callback
-     * @public
-     */
+    get OPEN() {
+        return WebSocketClient.OPEN;
+    }
+
+    get CLOSED() {
+        return WebSocketClient.CLOSED;
+    }
+
+    get readyState() {
+        return this.nativeSocket !== null ? WebSocketClient.OPEN : WebSocketClient.CLOSED;
+    }
+
+    // from here down, functions are not common between client and server
+
+    sendPrepared(preparedMessage) {
+        // ignore sends on closed sockets
+        if (!this.nativeSocket) {
+            return;
+        }
+
+        this.nativeServer.sendPrepared(this.nativeSocket, preparedMessage);
+    }
+
+    ping(message, options, dontFailWhenClosed) {
+        // ignore sends on closed sockets
+        if (!this.nativeSocket) {
+            return;
+        }
+
+        this.nativeServer.send(this.nativeSocket, message, WebSocketClient.OPCODE_PING);
+    }
+
     send(message, options, cb) {
-        /* ignore sends on closed sockets */
+        // ignore sends on closed sockets
         if (typeof options === 'function') {
             cb = options;
             options = null;
@@ -212,50 +233,13 @@ class Socket {
         }
 
         const binary = options && options.binary || typeof message !== 'string';
-        this.nativeServer.send(this.nativeSocket, message, binary ? Socket.OPCODE_BINARY : Socket.OPCODE_TEXT, cb ? (() => {
+        this.nativeServer.sendServer(this.nativeSocket, message, binary ? WebSocketClient.OPCODE_BINARY : WebSocketClient.OPCODE_TEXT, cb ? (() => {
             process.nextTick(cb);
         }) : undefined);
     }
 
-    /**
-     * Sends a prepared message.
-     *
-     * @param {Object} preparedMessage The prepared message to send
-     * @public
-     */
-    sendPrepared(preparedMessage) {
-        /* ignore sends on closed sockets */
-        if (!this.nativeSocket) {
-            return;
-        }
-
-        this.nativeServer.sendPrepared(this.nativeSocket, preparedMessage);
-    }
-
-    /**
-     * Sends a ping.
-     *
-     * @param {String|ArrayBuffer} message The message to send
-     * @param {Object} options Send options
-     * @param {Boolean} dontFailWhenClosed optional boolean
-     * @public
-     */
-    ping(message, options, dontFailWhenClosed) {
-        /* ignore sends on closed sockets */
-        if (!this.nativeSocket) {
-            return;
-        }
-
-        this.nativeServer.send(this.nativeSocket, message, Socket.OPCODE_PING);
-    }
-
-    /**
-     * Phony _socket object constructed on read.
-     *
-     * @public
-     */
     get _socket() {
-        const address = this.nativeServer ? this.nativeServer.getAddress(this.nativeSocket) : new Array(3);
+        const address = this.nativeServer ? this.nativeServer.getAddressServer(this.nativeSocket) : new Array(3);
         return {
             remotePort: address[0],
             remoteAddress: address[1],
@@ -263,38 +247,11 @@ class Socket {
         };
     }
 
-    /**
-     * Per-instance readyState constants.
-     *
-     * @public
-     */
-    get OPEN() {
-        return Socket.OPEN;
-    }
-
-    get CLOSED() {
-        return Socket.CLOSED;
-    }
-
-    /**
-     * Returns the state of the socket (OPEN or CLOSED).
-     *
-     * @public
-     */
-    get readyState() {
-        return this.nativeSocket !== null ? Socket.OPEN : Socket.CLOSED;
-    }
-
-    /**
-     * Closes the socket.
-     *
-     * @public
-     */
     close(code, data) {
-        /* ignore close on closed sockets */
+        // ignore close on closed sockets
         if (!this.nativeSocket) return;
 
-        /* Engine.IO, we cannot emit 'close' from within this function call */
+        // Engine.IO, we cannot emit 'close' from within this function call
         const nativeSocket = this.nativeSocket, nativeServer = this.nativeServer;
         process.nextTick(() => {
             nativeServer.close(nativeSocket, code, data);
@@ -304,30 +261,66 @@ class Socket {
     }
 }
 
+class WebSocketClient extends WebSocket {
+
+    constructor(uri) {
+        super(null, null);
+        this.internalOnOpen = noop;
+        hub.connect(uri, this);
+    }
+
+    send(message, options, cb) {
+        // ignore sends on closed sockets
+        if (typeof options === 'function') {
+            cb = options;
+            options = null;
+        }
+        if (!this.nativeSocket) {
+            return cb && cb(new Error('not opened'));
+        }
+
+        const binary = options && options.binary || typeof message !== 'string';
+        hub.sendClient(this.nativeSocket, message, binary ? WebSocketClient.OPCODE_BINARY : WebSocketClient.OPCODE_TEXT, cb ? (() => {
+            process.nextTick(cb);
+        }) : undefined);
+    }
+
+    close(code, data) {
+        // ignore close on closed sockets
+        if (!this.nativeSocket) return;
+
+        // Engine.IO, we cannot emit 'close' from within this function call
+        const nativeSocket = this.nativeSocket, nativeServer = this.nativeServer;
+        process.nextTick(() => {
+            nativeServer.close(nativeSocket, code, data);
+        });
+
+        this.nativeServer = this.nativeSocket = null;
+    }
+
+}
+
 class Server extends EventEmitter {
-    /**
-     * Creates a Server instance.
-     *
-     * @param {Object} options Configuration options
-     */
+
     constructor(options, callback) {
         super();
 
-        var nativeOptions = Socket.PERMESSAGE_DEFLATE;
+        var nativeOptions = WebSocketClient.PERMESSAGE_DEFLATE;
         if (options.perMessageDeflate !== undefined) {
             if (options.perMessageDeflate === false) {
                 nativeOptions = 0;
             } else {
                 if (options.perMessageDeflate.serverNoContextTakeover === true) {
-                    nativeOptions |= Socket.SERVER_NO_CONTEXT_TAKEOVER;
+                    nativeOptions |= WebSocketClient.SERVER_NO_CONTEXT_TAKEOVER;
                 }
                 if (options.perMessageDeflate.clientNoContextTakeover === true) {
-                    nativeOptions |= Socket.CLIENT_NO_CONTEXT_TAKEOVER;
+                    nativeOptions |= WebSocketClient.CLIENT_NO_CONTEXT_TAKEOVER;
                 }
             }
         }
 
-        this.nativeServer = new uws.Server(0, nativeOptions, options.maxPayload === undefined ? 1048576 : options.maxPayload);
+        // here we need to create a new group - let the group take options
+        this.nativeServer = hub;//Hub.createGroupServer();//new uws.Hub(nativeOptions, options.maxPayload === undefined ? 1048576 : options.maxPayload);
 
         // can these be made private?
         this._upgradeReq = null;
@@ -393,27 +386,27 @@ class Server extends EventEmitter {
             });
         }
 
-        this.nativeServer.onDisconnection((nativeSocket, code, message, socketData) => {
+        this.nativeServer.onDisconnectionServer((nativeSocket, code, message, socketData) => {
             socketData.nativeServer = socketData.nativeSocket = null;
             socketData.internalOnClose(code, message);
-            this.nativeServer.setData(nativeSocket);
+            this.nativeServer.clearUserDataServer(nativeSocket);
         });
 
-        this.nativeServer.onMessage((message, socketData) => {
+        this.nativeServer.onMessageServer((message, socketData) => {
             socketData.internalOnMessage(message);
         });
 
-        this.nativeServer.onPing((message, socketData) => {
+        this.nativeServer.onPingServer((message, socketData) => {
             socketData.onping(message);
         });
 
-        this.nativeServer.onPong((message, socketData) => {
+        this.nativeServer.onPongServer((message, socketData) => {
             socketData.onpong(message);
         });
 
-        this.nativeServer.onConnection((nativeSocket) => {
-            const socketData = new Socket(nativeSocket, this.nativeServer);
-            this.nativeServer.setData(nativeSocket, socketData);
+        this.nativeServer.onConnectionServer((nativeSocket) => {
+            const socketData = new WebSocket(nativeSocket, this.nativeServer);
+            this.nativeServer.setUserDataServer(nativeSocket, socketData);
 
             socketData.upgradeReq = {
                 url: this._upgradeReq.url,
@@ -433,15 +426,6 @@ class Server extends EventEmitter {
         }
     }
 
-    /**
-     * Handles a HTTP Upgrade request.
-     *
-     * @param {http.IncomingMessage} request HTTP request
-     * @param {net.Socket} Socket between server and client
-     * @param {Buffer} upgradeHead The first packet of the upgraded stream
-     * @param {Function} callback Callback function
-     * @public
-     */
     handleUpgrade(request, socket, upgradeHead, callback) {
         const secKey = request.headers['sec-websocket-key'];
         const socketHandle = socket.ssl ? socket._parent._handle : socket._handle;
@@ -458,43 +442,18 @@ class Server extends EventEmitter {
         socket.destroy();
     }
 
-    /**
-     * Prepare a message for bulk sending.
-     *
-     * @param {String|ArrayBuffer} message The message to prepare
-     * @param {Boolean} binary Binary (or text) OpCode
-     * @public
-     */
     prepareMessage(message, binary) {
-        return this.nativeServer.prepareMessage(message, binary ? Socket.OPCODE_BINARY : Socket.OPCODE_TEXT);
+        return this.nativeServer.prepareMessage(message, binary ? WebSocketClient.OPCODE_BINARY : WebSocketClient.OPCODE_TEXT);
     }
 
-    /**
-     * Finalize (unreference) a message after bulk sending.
-     *
-     * @param {Object} preparedMessage The prepared message to finalize
-     * @public
-     */
     finalizeMessage(preparedMessage) {
         return this.nativeServer.finalizeMessage(preparedMessage);
     }
 
-    /**
-     * Broadcast a message to all sockets.
-     *
-     * @param {String|ArrayBuffer} message The message to broadcast
-     * @param {Object} options Broadcast options
-     * @public
-     */
     broadcast(message, options) {
         this.nativeServer.broadcast(message, options && options.binary || false);
     }
 
-     /**
-     * Closes the server.
-     *
-     * @public
-     */
     close() {
         if (this._upgradeListener && this.httpServer) {
             this.httpServer.removeListener('upgrade', this._upgradeListener);
@@ -505,14 +464,14 @@ class Server extends EventEmitter {
     }
 }
 
-Socket.PERMESSAGE_DEFLATE = 1;
-Socket.SERVER_NO_CONTEXT_TAKEOVER = 2;
-Socket.CLIENT_NO_CONTEXT_TAKEOVER = 4;
-Socket.OPCODE_TEXT = 1;
-Socket.OPCODE_BINARY = 2;
-Socket.OPCODE_PING = 9;
-Socket.OPEN = 1;
-Socket.CLOSED = 0;
-Socket.Server = Server;
-Socket.uws = uws;
-module.exports = Socket;
+WebSocketClient.PERMESSAGE_DEFLATE = 1;
+WebSocketClient.SERVER_NO_CONTEXT_TAKEOVER = 2;
+WebSocketClient.CLIENT_NO_CONTEXT_TAKEOVER = 4;
+WebSocketClient.OPCODE_TEXT = 1;
+WebSocketClient.OPCODE_BINARY = 2;
+WebSocketClient.OPCODE_PING = 9;
+WebSocketClient.OPEN = 1;
+WebSocketClient.CLOSED = 0;
+WebSocketClient.Server = Server;
+WebSocketClient.uws = uws;
+module.exports = WebSocketClient;
